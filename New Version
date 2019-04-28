@@ -1,0 +1,162 @@
+WITH t AS(SELECT *
+  FROM(
+  SELECT 
+    loan_num,
+    borrower_name AS Borrower_name1,
+    origination_funding_date AS Origination_Date,
+    current_rate,
+    ROW_NUMBER() OVER(PARTITION BY loan_num ORDER BY calculation_ts DESC) AS rk1,
+    CASE dlc.asset_owner_uuid_value 
+      WHEN '33ebc05c-f000-43a3-83e3-8d413d7c8b66' THEN 'MEDALIST PARTNERS HARVEST RESIDENTIAL LOAN ACQUISITION II LLC'
+      WHEN '3e576910-cc97-4f96-8d4a-7e193b3a75f8' THEN 'FIRST NATIONAL BANK OF AMERICA'
+      WHEN 'f598fb02-807c-4d91-8146-df85edd20997' THEN 'FORTIS PRIVATE BANK'
+      WHEN 'fdf442fb-dcf2-4f1e-b864-baafce8d045d' THEN 'JEFFERIES FUNDING LLC'
+      WHEN 'deadbeef-face-479b-860c-facefaceface' THEN 'FIGURE LENDING, LLC'
+      WHEN '4ad8efa2-ab8a-4da1-9932-cbe4dc8169e2' THEN 'TILDEN PARK DOMESTIC HOLDINGS LLC'
+      WHEN '2fe02699-c008-4716-99c5-a4ba2d075fba' THEN 'MEDALIST PARTNERS HARVEST MASTER FUND LTD'
+    ELSE 'ASSET OWNER NAME NOT ASSIGNED YET'
+    END AS Buyer_Name
+FROM reporting.agg_daily_loan_calc dlc) t0
+WHERE rk1=1),
+
+tt AS(SELECT 
+  *
+FROM(SELECT
+  application_uuid_value,
+  ROW_NUMBER() OVER(PARTITION BY application_uuid_value ORDER BY kafka_timestamp DESC) AS rk2,
+  IFNULL(SAFE_CAST(post_loan_adj_cltv AS FLOAT64),SAFE_CAST(pre_loan_adj_cltv AS FLOAT64))  AS Updated_CLTV,
+  IFNULL(SAFE_CAST(post_loan_dti AS FLOAT64),SAFE_CAST(pre_loan_dti AS FLOAT64))  AS Updated_DTI,
+  CASE 
+    WHEN SAFE_CAST(post_loan_adj_cltv AS FLOAT64) IS NULL AND SAFE_CAST(pre_loan_adj_cltv AS FLOAT64) IS NOT NULL AND SAFE_CAST(adjusted_home_amount AS FLOAT64) IS NOT NULL 
+    THEN SAFE_CAST(pre_loan_adj_cltv AS FLOAT64) + 15000/SAFE_CAST(adjusted_home_amount AS FLOAT64) END AS Min_Loan_CLTV
+FROM `figure-production.rpt_staging.stg_uw_decision`)
+WHERE rk2=1),
+
+ct AS (SELECT 
+  CASE
+    WHEN IFNULL(la.state, la.profile_state) IN ('HI') THEN 'Pacific/Honolulu'
+    WHEN IFNULL(la.state, la.profile_state) IN ('AK') THEN 'America/Anchorage'
+    WHEN IFNULL(la.state, la.profile_state) IN ('CA','WA','OR','NV') THEN 'America/Los_Angeles'
+    WHEN IFNULL(la.state, la.profile_state) IN ('AZ','UT','MT','NE','ID','NM','CO','WY') THEN 'America/Denver'
+    WHEN IFNULL(la.state, la.profile_state) IN ('ND','SD','NE','KS','OK','TX','MN','IA','MO','AR','LA','WI','IL','KY','TN','MS','AL') THEN 'America/Chicago'
+    WHEN IFNULL(la.state, la.profile_state) IN ('MI','IN','GA','FL','SC','NC','OH','WV','VA','PA','NY','VT','ME','NH','MA','RI','CT','NJ','DE','MD','DC') THEN 'America/New_York'
+    WHEN IFNULL(la.state, la.profile_state) IS NULL THEN 'America/Los_Angeles'
+    ELSE 'America/Los_Angeles'
+    END AS time_zone_lookup, 
+  ad.app_start_date,
+  IFNULL(t.loan_num,la.application_uuid_value) AS app_uuid1,
+  la.application_short_id,
+  t.Origination_Date,
+  IFNULL(ARRAY_TO_STRING([ad.first_name,ad.last_name],' '),ARRAY_TO_STRING([lp.first_name,lp.last_name],' ')) AS Borrower_Name,
+  la.status,
+  lo.decline_reasons AS Decline_Reasons,
+  lo.decline_codes AS Decline_Codes,
+  la.app_amount,
+  la.draw_amount,
+  ROUND((la.origination_fee*la.draw_amount),2) AS Origination_fee,  
+  IFNULL(ARRAY_TO_STRING([la.street1,la.street2],''),ARRAY_TO_STRING([lp.street1,lp.street2],'')) AS Street,
+  IFNULL(la.city, la.profile_city) AS City,
+  IFNULL(la.state, la.profile_state) AS State,
+  IFNULL(la.zip, la.profile_zip) AS Zip,
+  CASE 
+    WHEN la.property_type IN('HOME',NULL) THEN 'PRIMARY RESIDENCE'
+    ELSE la.property_type
+    END AS Occupancy,
+  la.ownership AS Ownership_Type, 
+  la.application_reason AS Purpose_Of_Loan,
+  tt.Updated_CLTV,
+  ROUND(tt.Min_Loan_CLTV,4) AS Min_Loan_CLTV,
+  tt.Updated_DTI,
+  lo.home_value AS Initial_AVM,
+  lo.adjusted_home_value AS Adjusted_AVM,
+  lo.lien_position AS Lien_Status,
+  IFNULL(t.current_rate,la.app_rate) AS Rate,
+  lo.avm_fsd AS FSD_Value,
+  IFNULL(la.credit_hard_fico,la.credit_soft_fico) AS FICO_Score,
+  ROUND(la.application_income,0) AS Stated_Income,
+  ROUND(CAST(ad.verified_income_amount AS FLOAT64),0) AS Verified_Income,
+  (la.app_term*12) AS Term,
+  t.Buyer_Name
+FROM `figure-production.reporting.lkup_application` la
+LEFT JOIN `figure-production.reporting.application_details` ad 
+  ON (ad.application_uuid_value = la.application_uuid_value)
+LEFT JOIN `figure-production.reporting.lkup_profile` lp 
+  ON (lp.identity_uuid_value =la.identity_uuid_value)
+LEFT JOIN tt 
+  ON (tt.application_uuid_value = la.application_uuid_value)
+LEFT JOIN t 
+  ON (t.loan_num = la.application_uuid_value)
+JOIN reporting.agg_loan_output lo 
+  ON (lo.application_uuid_value = la.application_uuid_value)),
+
+r AS( SELECT
+  application_uuid_value,
+  stage,
+  stage_exit_ts 
+FROM  reporting.figure_funnel_event
+WHERE  stage_num = 6.25),
+
+rr AS (SELECT
+  ROW_NUMBER() OVER(PARTITION BY application_uuid_value ORDER BY stage_entry_ts DESC) AS rk,
+  fe.*
+FROM reporting.figure_funnel_event fe),
+
+cr AS (SELECT * 
+FROM (SELECT
+  rr.application_uuid_value,
+  rr.stage,
+  rr.stage_num,
+  CASE 
+    WHEN (rr.rk =1 AND rr.stage_num IN(9,10.5,11)) OR rr.stage_num = 11 THEN IFNULL(r.stage_exit_ts,rr.stage_entry_ts)
+    WHEN rr.rk =1 AND rr.stage_num IN (98,99) THEN rr.stage_entry_ts
+  END AS Decision_Datetime,
+  'HELOC' AS Loan_Type
+FROM rr
+LEFT JOIN r ON r.application_uuid_value = rr.application_uuid_value) r0
+WHERE Decision_Datetime IS NOT NULL),
+
+RF AS(SELECT 
+  DATETIME(ct.app_start_date, ct.time_zone_lookup) AS Application_Date,
+  ct.app_uuid1 AS Loan_Num,
+  status AS Decision,
+  DATETIME(Decision_Datetime, ct.time_zone_lookup) AS Decision_Date,
+  ct.Borrower_Name,
+  ct.Origination_Date,
+  ct.Purpose_Of_Loan AS Purpose_Of_Loan,
+  ct.Occupancy AS Occupancy,
+  Loan_Type AS Product_Type,
+  ct.Ownership_Type AS Ownership_Type,
+  ct.Street AS Property_Address,
+  ct.City AS City,
+  ct.State AS State,
+  ct.Zip AS Zip,
+  ct.Initial_AVM,
+  ct.Adjusted_AVM,
+  ct.Rate AS APR,
+  ct.Lien_Status,
+  ct.Term AS Term,
+  ct.Origination_fee,
+  ct.draw_amount AS Initial_Draw_Amount,
+  ct.app_amount AS Loan_Amount,
+  ct.FICO_Score AS FICO_Score,
+  ct.FSD_Value AS FSD_Value,
+  ct.Updated_CLTV AS CLTV,
+  ct.Min_Loan_CLTV AS Min_Loan_CLTV,
+  ct.Updated_DTI AS DTI,
+  ct.Stated_Income AS Stated_Income,
+  ct.Verified_Income AS Verified_Income,
+  ct.Decline_Reasons,
+  ct.Decline_Codes,
+  COALESCE(ct.Buyer_Name,'ASSET OWNER NAME NOT ASSIGNED YET') AS Buyer_Name
+FROM cr
+JOIN ct ON ct.app_uuid1 = cr.application_uuid_value)
+
+SELECT 
+  * 
+FROM(SELECT
+  *,
+  ROW_NUMBER() OVER(PARTITION BY Loan_Num ORDER BY Application_Date) as R
+FROM RF
+WHERE Decision_Date IS NOT NULL) d
+WHERE R=1 AND Decision IN ('DECLINED','CANCELLED','COMPLETE','RESCISSION','RECORDING')
+ORDER BY 1 DESC
