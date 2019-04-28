@@ -1,0 +1,87 @@
+SELECT * FROM(WITH f AS(SELECT CASE 
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('HI') THEN 'Pacific/Honolulu'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('AK') THEN 'America/Anchorage'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('CA','WA','OR','NV') THEN 'America/Los_Angeles'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('AZ','UT','MT','NE','ID','NM','CO','WY') THEN 'America/Denver'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('ND','SD','NE','KS','OK','TX','MN','IA','MO','AR','LA','WI','IL','KY','TN','MS','AL') THEN 'America/Chicago'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IN ('MI','IN','GA','FL','SC','NC','OH','WV','VA','PA','NY','VT','ME','NH','MA','RI','CT','NJ','DE','MD','DC') THEN 'America/New_York'
+    WHEN IFNULL(ad.prop_state, ad.profile_state) IS NULL THEN 'America/Los_Angeles'
+    ELSE 'America/Los_Angeles'
+    END AS time_zone_lookup, 
+    ad.application_uuid_value,
+    ad.prop_street_address as Prop_Address,
+    ad.profile_state as profile_state,
+    ad.prop_city as Pro_City,
+    ad.prop_state as Pro_State,
+    ad.prop_zip as Pro_Zip,
+    IFNULL(ad.credit_hard_fico,ad.credit_soft_fico) AS FICO_Score,
+    IFNULL(ad.post_loan_adj_cltv, ad.pre_loan_adj_cltv) AS Final_CLTV1,
+    IFNULL(ad.post_loan_dti, ad.pre_loan_dti ) AS Final_DTI1,
+    (ad.app_term * 12) AS Term_In_Months,
+    IFNULL(ad.property_type,'Primary Residence') AS Occupancy_Type,
+    ad.ownership AS Ownership_Type,
+    sda.decline_reasons AS decline_reasons,
+    sda.decline_codes AS decline_codes,
+    concat(ad.first_name,' ',ad.last_name) as Full_Name
+FROM reporting.application_details ad
+LEFT JOIN rpt_staging.stg_declined_applications sda ON sda.application_uuid_value = ad.application_uuid_value),
+ff AS(
+SELECT * FROM(SELECT 
+application_uuid_value, 
+IFNULL(SAFE_CAST(post_loan_dti AS FLOAT64),SAFE_CAST(pre_loan_dti AS FLOAT64))  AS loan_dti,
+SAFE_CAST(selected_offer_int_rate AS FLOAT64) AS int_rate,
+TIMESTAMP_SECONDS(CAST((update_date_secs + update_date_nanos/1000000000) AS INT64)) AS Date_Time,
+rank() OVER(PARTITION BY application_uuid_value ORDER BY (TIMESTAMP_SECONDS(CAST((update_date_secs + update_date_nanos/1000000000) AS INT64))) DESC) AS ranking
+FROM `figure-production.rpt_staging.stg_uw_decision`) AS fff
+WHERE ranking = 1 AND loan_dti IS NOT NULL) 
+SELECT
+  DATETIME(CAST(lo.app_start_date_utc AS TIMESTAMP),time_zone_lookup) AS Application_Date,
+  lo.app_start_date_utc AS Ori_Application_Date,
+  IFNULL(dlc.loan_num, f.application_uuid_value)AS Loan_No,
+  dlc.origination_funding_date AS Loan_Funded_Date,
+  CASE WHEN ablfs.stage IN ('Recording','Cancelled','Complete','Declined','Rescission') THEN lo.funnel_state END AS Decision,
+  IFNULL(lo.decline_reasons,f.decline_reasons) AS Decline_Reasons,
+  IFNULL(lo.decline_codes,f.decline_codes) AS Decline_Codes,
+  DATETIME(CAST(ablfs.current_stage_entry_ts AS TIMESTAMP),time_zone_lookup) AS Decision_Date,
+  ablfs.current_stage_entry_ts AS Original_Date,
+  IFNULL(dlc.borrower_name,f.full_name) AS Borrower_Full_Name,
+  CASE WHEN f.application_uuid_value IS NOT NULL THEN 'HELOC' END AS Loan_Type,
+  lo.loan_purpose AS Loan_Purpose,
+  f.Occupancy_Type,
+  f.Prop_Address,
+  f.Pro_City,
+  f.Pro_State,
+  f.profile_state,
+  f.Pro_Zip,
+  lo.home_value AS Initial_AVM,
+  lo.adjusted_home_value AS Adjusted_AVM,
+  IFNULL(dlc.origination_loan_amount, lo.loan_amount) AS Loan_Amount,
+  lo.stated_income AS Stated_Income,
+  lo.draw_amount AS Initial_Draw_Amount,
+  IFNULL(lo.post_loan_dti, ff.loan_dti) AS Final_DTI,
+  IFNULL(lo.post_loan_cltv, f.Final_CLTV1) AS Final_CLTV,
+  f.FICO_Score,
+  lo.avm_fsd AS FSD_Value, 
+  lo.lien_position AS Lien_Status,
+  lo.Funnel_State AS Funnel_State,
+  IFNULL(CAST(dlc.current_rate AS FLOAT64),ff.int_rate) AS APR,
+  f.Term_In_Months,
+  f.Ownership_Type,
+  ROUND((lo.origination_fee * lo.loan_amount),2) AS Origination_Fees,
+  CASE dlc.asset_owner_uuid_value 
+    WHEN '33ebc05c-f000-43a3-83e3-8d413d7c8b66' THEN 'MEDALIST PARTNERS HARVEST RESIDENTIAL LOAN ACQUISITION II LLC'
+    WHEN '3e576910-cc97-4f96-8d4a-7e193b3a75f8' THEN 'FIRST NATIONAL BANK OF AMERICA'
+    WHEN 'f598fb02-807c-4d91-8146-df85edd20997' THEN 'FORTIS PRIVATE BANK'
+    WHEN 'fdf442fb-dcf2-4f1e-b864-baafce8d045d' THEN 'JEFFERIES FUNDING LLC'
+    WHEN 'deadbeef-face-479b-860c-facefaceface' THEN 'FIGURE LENDING, LLC'
+    WHEN '4ad8efa2-ab8a-4da1-9932-cbe4dc8169e2' THEN 'TILDEN PARK DOMESTIC HOLDINGS LLC'
+    WHEN '2fe02699-c008-4716-99c5-a4ba2d075fba' THEN 'MEDALIST PARTNERS HARVEST MASTER FUND LTD'
+  ELSE 'Asset Owner Name not Assigned yet'
+  END AS Buyer_Name
+FROM f
+JOIN reporting.agg_loan_output lo ON lo.application_uuid_value = f.application_uuid_value 
+JOIN reporting.application_by_latest_funnel_state ablfs ON ablfs.application_uuid_value = f.application_uuid_value
+JOIN ff On ff.application_uuid_value = f.application_uuid_value
+LEFT JOIN reporting.agg_daily_loan_calc dlc ON dlc.loan_num = lo.application_uuid_value
+ORDER BY 1 DESC, 4 DESC) f00
+WHERE Decision = 'Declined'  and Decline_Reasons IS NULL and Borrower_Full_Name = 'Sara Paez'
