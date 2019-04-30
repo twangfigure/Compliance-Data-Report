@@ -69,7 +69,12 @@ ct AS (SELECT
   tt.Updated_DTI,
   lo.home_value AS Initial_AVM,
   lo.adjusted_home_value AS Adjusted_AVM,
-  lo.lien_position AS Lien_Status,
+  CASE 
+  la.uw_first_lien
+  WHEN TRUE THEN 'First'
+  WHEN FALSE THEN 'Subordinate'
+  ELSE 'N/A' 
+  END AS Lien_Status,
   IFNULL(t.current_rate,la.app_rate) AS Rate,
   lo.avm_fsd AS FSD_Value,
   IFNULL(la.credit_hard_fico,la.credit_soft_fico) AS FICO_Score,
@@ -152,7 +157,7 @@ FROM cr
 JOIN ct ON ct.app_uuid1 = cr.application_uuid_value)
 
 SELECT 
-  * 
+ *
 FROM(SELECT
   *,
   ROW_NUMBER() OVER(PARTITION BY Loan_Num ORDER BY Application_Date) as R
