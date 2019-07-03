@@ -49,8 +49,8 @@ ct AS (SELECT
   t.Origination_Date,
   IFNULL(ARRAY_TO_STRING([ad.first_name,ad.last_name],' '),ARRAY_TO_STRING([lp.first_name,lp.last_name],' ')) AS Borrower_Name,
   la.status,
-  lo.decline_reasons AS Decline_Reasons,
-  lo.decline_codes AS Decline_Codes,
+  IFNULL(lo.decline_reasons, lo.adverse_action_declineReasons) AS Decline_Reasons,
+  IFNULL(lo.decline_codes,lo.app_checklist_summary_cancellation_details_rejection_reason_codes) AS Decline_Codes,
   la.app_amount,
   la.draw_amount,
   ROUND((la.origination_fee*la.draw_amount),2) AS Origination_fee,  
@@ -150,8 +150,8 @@ RF AS(SELECT
   ct.Updated_DTI AS DTI,
   ct.Stated_Income AS Stated_Income,
   ct.Verified_Income AS Verified_Income,
-  ct.Decline_Reasons,
   ct.Decline_Codes,
+  ct.Decline_Reasons,
   COALESCE(ct.Buyer_Name,'ASSET OWNER NAME NOT ASSIGNED YET') AS Buyer_Name
 FROM cr
 JOIN ct ON ct.app_uuid1 = cr.application_uuid_value)
@@ -163,5 +163,6 @@ FROM(SELECT
   ROW_NUMBER() OVER(PARTITION BY Loan_Num ORDER BY Application_Date) as R
 FROM RF
 WHERE Decision_Date IS NOT NULL) d
-WHERE R=1 AND Decision IN ('DECLINED','CANCELLED','COMPLETE','RESCISSION','RECORDING')
+WHERE R=1 AND Decision IN ('DECLINED','CANCELLED','COMPLETE','RESCISSION','RECORDING') and Decline_Codes IS NULL
 ORDER BY 1 DESC
+
